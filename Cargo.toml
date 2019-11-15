@@ -12,3 +12,4 @@ exit-future = "0.1"
 futures = "0.1"
 ctrlc = { version = "3.0", features = ["termination"] }
 log = "0.4"
+signal-hook = { version = "0.1.11", features = ["tokio-support"] }
