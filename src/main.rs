@@ -10,21 +10,31 @@ use tokio::timer::Interval;
 use std::time::{Instant, Duration};
 use std::thread::sleep;
 use log::warn;
-use signal_hook::{iterator::Signals, SIGUSR1};
+use signal_hook::{iterator::Signals, SIGUSR1, SIGINT, SIGTERM};
+use std::thread;
 
 fn main() {
-    execute();
+
+    let mut run = true;
+
+    while run{
+        let exit_item = execute();
+        run = match exit_item{
+            ExitItem::Stop => false,
+            ExitItem::Restart => true,
+        }
+    }
 }
 
-fn execute() {
+fn execute() -> ExitItem {
 
     let outer_exit = OuterExit;
 
-    start_service(outer_exit);
+    start_service(outer_exit)
 
 }
 
-fn start_service(outer_exit: OuterExit){
+fn start_service<E: IntoExit>(outer_exit: E) -> E::Item{
 
     println!("Start service");
 
@@ -35,11 +45,13 @@ fn start_service(outer_exit: OuterExit){
 
     start_task(exit, executor);
 
-    runtime.block_on(outer_exit.into_exit());
+    let exit_item = runtime.block_on(outer_exit.into_exit()).unwrap();
 
     exit_send.fire();
 
     println!("Finish service");
+
+    exit_item
 }
 
 fn start_task(exit: Exit, executor: TaskExecutor){
@@ -63,25 +75,45 @@ fn start_task(exit: Exit, executor: TaskExecutor){
 }
 
 pub trait IntoExit {
+    type Item: Send + 'static;
     /// Exit signal type.
-    type Exit: Future<Item=(),Error=()> + Send + 'static;
+    type Exit: Future<Item=Self::Item,Error=()> + Send + 'static;
     /// Convert into exit signal.
     fn into_exit(self) -> Self::Exit;
 }
 
+#[derive(Debug)]
+pub enum ExitItem{
+    Stop,
+    Restart,
+}
+
 pub struct OuterExit;
 impl IntoExit for OuterExit {
-    type Exit = future::MapErr<oneshot::Receiver<()>, fn(oneshot::Canceled) -> ()>;
+    type Item = ExitItem;
+    type Exit = future::MapErr<oneshot::Receiver<Self::Item>, fn(oneshot::Canceled) -> ()>;
     fn into_exit(self) -> Self::Exit {
         // can't use signal directly here because CtrlC takes only `Fn`.
         let (exit_send, exit) = oneshot::channel();
 
         let exit_send_cell = RefCell::new(Some(exit_send));
-        ctrlc::set_handler(move || {
-            if let Some(exit_send) = exit_send_cell.try_borrow_mut().expect("signal handler not reentrant; qed").take() {
-                exit_send.send(()).expect("Error sending exit notification");
+
+        let signals = Signals::new(&[SIGUSR1, SIGINT, SIGTERM]).unwrap();
+
+        thread::spawn(move || {
+            for sig in signals.forever() {
+                println!("Received signal {:?}", sig);
+
+                let item = match sig{
+                    SIGUSR1 => ExitItem::Restart,
+                    _ => ExitItem::Stop,
+                };
+
+                if let Some(exit_send) = exit_send_cell.try_borrow_mut().expect("signal handler not reentrant; qed").take() {
+                    exit_send.send(item).expect("Error sending exit notification");
+                }
             }
-        }).expect("Error setting Ctrl-C handler");
+        });
 
         exit.map_err(drop)
     }
